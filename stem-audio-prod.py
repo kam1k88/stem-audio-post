@@ -1,5 +1,5 @@
 """
-AI_Mixer.py — Единое приложение с автоустановкой зависимостей, Drag&Drop и мастерингом.
+stem-audio-post.py — Единое приложение с автоустановкой зависимостей, Drag&Drop и мастерингом.
 """
 import os
 import sys
@@ -350,14 +350,14 @@ def process_track(input_path, output_path, log_func):
 class MixerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AI Mix & Master Studio")
+        self.root.title("stem-audio-post")
         self.root.geometry("600x550")
         self.root.configure(bg="#2b2b2b")
         
         self.input_file = None
         self.output_file = None
         
-        tk.Label(root, text="AI Mix & Master", font=("Arial", 18, "bold"), fg="white", bg="#2b2b2b").pack(pady=10)
+        tk.Label(root, text="stem-audio-post", font=("Arial", 18, "bold"), fg="white", bg="#2b2b2b").pack(pady=10)
         
         self.drop_zone = tk.Label(root, text="Перетащите аудиофайл (MP3 / WAV / FLAC)\nсюда", 
                                   bg="#404040", fg="#a0a0a0", font=("Arial", 12), height=5, relief="groove", bd=2)
