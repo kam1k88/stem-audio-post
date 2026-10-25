@@ -1,0 +1,7 @@
+numpy
+soundfile
+scipy
+pyloudnorm
+pedalboard
+tkinterdnd2
+demucs
