@@ -5,10 +5,10 @@ Stem Audio Post — автоматизация сведения и экспор�
 1. При необходимости разделяет готовый трек на drums / bass / other / vocals через Demucs.
 2. Обрабатывает стемы умеренными, отключаемыми DSP-операциями.
 3. Собирает стереомикс, нормализует громкость и ограничивает sample peak.
-4. Сохраняет WAV float и отчёт JSON; из интерфейса можно экспортировать FLAC PCM_24.
+4. Сохраняет промежуточный предпросмотр в кэш; после анализа пользователь сам выбирает экспорт MP3/WAV/FLAC.
 
 Важно:
-- Это автоматизированный стартовый микс, а не универсальный мастеринг.
+- Это автоматизированная цепочка DSP, а не гарантия универсального профессионального мастеринга.
 - Все значения обработки — исходные настройки, их нужно проверять на слух.
 - Demucs — предобученная модель разделения источников; остальная обработка не является ИИ.
 """
@@ -55,7 +55,7 @@ check_dependencies()
 import numpy as np
 import soundfile as sf
 import pyloudnorm as pyln
-from scipy.signal import resample_poly
+from scipy.signal import resample_poly, butter, sosfilt
 from pedalboard import (
     Pedalboard,
     Compressor,
@@ -74,7 +74,7 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 APP_NAME = "Stem Audio Post"
 MODEL_NAME = "htdemucs_ft"
 PARTS = ("drums", "bass", "other", "vocals")
-TARGET_LUFS = -14.0
+TARGET_LUFS = -12.0
 PEAK_CEILING_DBFS = -1.0
 DEFAULT_SR = 44100
 SUPPORTED_INPUTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aiff", ".aif"}
@@ -82,20 +82,28 @@ SUPPORTED_INPUTS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aiff", ".aif"}
 
 @dataclass
 class Settings:
-    """Умеренные стартовые параметры; не заменяют настройку под конкретный трек."""
-    target_lufs: float = TARGET_LUFS
-    peak_ceiling_dbfs: float = PEAK_CEILING_DBFS
+    """Настройки обработки. Каждый из 12 блоков можно включить или отключить."""
+    target_lufs: float = -12.0
+    peak_ceiling_dbfs: float = -1.0
     drums_gain_db: float = 0.0
     bass_gain_db: float = 0.0
     other_gain_db: float = -1.0
     vocals_gain_db: float = 0.0
-    vocal_duck_db: float = -1.5
-    kick_duck_db: float = -1.5
+    vocal_duck_db: float = -3.0
+    kick_duck_db: float = -2.0
     drum_width: float = 1.05
+    use_bass_multiband: bool = True
+    use_bass_enhance: bool = True
+    use_drum_punch: bool = True
+    use_vocal_surgical: bool = True
+    use_instrument_eq: bool = True
     use_vocal_ducking: bool = True
     use_kick_ducking: bool = True
-    use_gentle_eq: bool = True
-    use_stereo_widening: bool = True
+    use_drum_widening: bool = False
+    use_low_mono: bool = True
+    use_high_side_widening: bool = False
+    use_parallel_compression: bool = True
+    use_master_bus: bool = True
 
 
 def log_exception(log: Callable[[str], None], prefix: str, exc: BaseException) -> None:
@@ -419,6 +427,122 @@ def measure_audio(x: np.ndarray, sr: int) -> dict:
     }
 
 
+def _filter_band(x: np.ndarray, low: float | None = None, high: float | None = None) -> np.ndarray:
+    """Butterworth filter on stereo audio; returns float32."""
+    nyq = DEFAULT_SR / 2
+    if low is not None and high is not None:
+        low, high = max(10.0, low), min(nyq * 0.95, high)
+        if low >= high:
+            return np.zeros_like(x)
+        sos = butter(3, [low, high], btype="bandpass", fs=DEFAULT_SR, output="sos")
+    elif low is not None:
+        sos = butter(3, max(10.0, low), btype="highpass", fs=DEFAULT_SR, output="sos")
+    elif high is not None:
+        sos = butter(3, min(nyq * 0.95, high), btype="lowpass", fs=DEFAULT_SR, output="sos")
+    else:
+        return x.copy()
+    return np.stack([sosfilt(sos, x[:, ch]) for ch in range(x.shape[1])], axis=1).astype(np.float32)
+
+
+def _peak_eq(x: np.ndarray, freq: float, gain_db: float, q: float = 1.0) -> np.ndarray:
+    """Bell EQ via Pedalboard."""
+    return Pedalboard([PeakFilter(cutoff_frequency_hz=freq, gain_db=gain_db, q=q)])(x.T, DEFAULT_SR).T.astype(np.float32)
+
+
+def _compress(x: np.ndarray, threshold: float, ratio: float, attack: float = 10, release: float = 100) -> np.ndarray:
+    return Pedalboard([Compressor(threshold_db=threshold, ratio=ratio, attack_ms=attack, release_ms=release)])(x.T, DEFAULT_SR).T.astype(np.float32)
+
+
+def _saturate(x: np.ndarray, drive_db: float = 3.0, mix: float = 0.15) -> np.ndarray:
+    # Soft-clipping saturation, mixed in conservatively to avoid brittle distortion.
+    driven = np.tanh(x * db_to_gain(drive_db)) / max(1e-8, np.tanh(db_to_gain(drive_db)))
+    return ((1.0 - mix) * x + mix * driven).astype(np.float32)
+
+
+def _low_mono(x: np.ndarray, cutoff: float = 120.0) -> np.ndarray:
+    low = _filter_band(x, high=cutoff)
+    high = x - low
+    mono_low = np.repeat(low.mean(axis=1, keepdims=True), 2, axis=1)
+    return (mono_low + high).astype(np.float32)
+
+
+def _widen_high_side(x: np.ndarray, amount_db: float = 3.0, cutoff: float = 10000.0) -> np.ndarray:
+    mid = x.mean(axis=1)
+    side = (x[:, 0] - x[:, 1]) * 0.5
+    # Keep low/mid side untouched; increase only the high-frequency side component.
+    sos = butter(2, cutoff, btype="highpass", fs=DEFAULT_SR, output="sos")
+    high_side = sosfilt(sos, side)
+    widened_side = side + high_side * (db_to_gain(amount_db) - 1.0)
+    return np.stack([mid + widened_side, mid - widened_side], axis=1).astype(np.float32)
+
+
+def _pitch_octave_up(x: np.ndarray, log: Callable[[str], None]) -> np.ndarray | None:
+    """Use Pedalboard PitchShift if present; otherwise report a safe skip."""
+    try:
+        from pedalboard import PitchShift
+        return Pedalboard([PitchShift(semitones=12)])(x.T, DEFAULT_SR).T.astype(np.float32)
+    except Exception as exc:
+        log(f"Предупреждение: PitchShift недоступен, гармонический слой пропущен ({exc}).")
+        return None
+
+
+def _apply_bass_chain(bass: np.ndarray, drums: np.ndarray, log: Callable[[str], None]) -> np.ndarray:
+    # Three frequency layers: sub, body and top. Gain/EQ is intentionally moderate.
+    sub = _filter_band(bass, high=100.0)
+    sub = _peak_eq(sub, 50.0, 3.0, 0.8)
+    sub = _compress(sub, -18.0, 4.0, 25, 160)
+    body = _filter_band(bass, low=100.0, high=500.0)
+    body = _peak_eq(body, 250.0, -4.0, 1.0)
+    body = _peak_eq(body, 150.0, 2.0, 1.0)
+    top = _filter_band(bass, low=500.0)
+    top = _peak_eq(top, 800.0, 3.0, 0.9)
+    top = _saturate(top, 10.0, 0.18)
+    # Avoid double-counting the whole-band signal: split bands sum back together.
+    return (sub + body + top).astype(np.float32)
+
+
+def _bass_enhance(bass: np.ndarray, drums: np.ndarray, log: Callable[[str], None]) -> np.ndarray:
+    result = bass.copy()
+    octave = _pitch_octave_up(bass, log)
+    if octave is not None:
+        octave = _filter_band(octave, low=300.0)
+        octave = _saturate(octave, 5.0, 0.20)
+        result += octave * 0.20
+    kick = _filter_band(drums, low=100.0, high=2000.0)
+    result += kick * 0.12
+    return result.astype(np.float32)
+
+
+def _process_drums(x: np.ndarray) -> np.ndarray:
+    y = _saturate(x, 1.0, 0.12)
+    y = _peak_eq(y, 55.0, 3.0, 0.8)
+    y = _peak_eq(y, 200.0, -3.0, 1.0)
+    y = _peak_eq(y, 3500.0, 4.0, 1.2)
+    y = _peak_eq(y, 8000.0, 1.0, 0.8)
+    return y
+
+
+def _process_vocals(x: np.ndarray) -> np.ndarray:
+    y = _filter_band(x, low=70.0)
+    y = _peak_eq(y, 500.0, -3.0, 1.0)
+    y = _peak_eq(y, 2500.0, 2.0, 1.0)
+    y = _peak_eq(y, 3000.0, 4.0, 1.1)
+    y = _peak_eq(y, 8000.0, 2.0, 0.8)
+    # Gentle center/level control. Side channel is left mostly intact for ambience.
+    mid = np.repeat(y.mean(axis=1, keepdims=True), 2, axis=1)
+    side = (y - mid) * 1.2
+    centered = (mid + side).astype(np.float32)
+    return _compress(centered, -20.0, 3.0, 25, 180)
+
+
+def _process_instruments(x: np.ndarray) -> np.ndarray:
+    y = _peak_eq(x, 1500.0, -2.0, 1.1)
+    y = _peak_eq(y, 2500.0, -2.0, 1.0)
+    y = _peak_eq(y, 800.0, 2.0, 0.9)
+    y = _peak_eq(y, 3000.0, 3.0, 1.0)
+    return y
+
+
 def process_track(input_path: Path, output_path: Path, settings: Settings,
                   log: Callable[[str], None]) -> dict:
     input_path = input_path.resolve()
@@ -434,72 +558,68 @@ def process_track(input_path: Path, output_path: Path, settings: Settings,
 
     log("Загружаю и проверяю стемы…")
     buffers: dict[str, np.ndarray] = {}
-    sample_rates = []
     for part in PARTS:
         path = stems_dir / f"{part}.wav"
-        x, sr = load_audio(path, DEFAULT_SR)
+        if not path.is_file():
+            raise FileNotFoundError(f"Нет стема {part}: {path}")
+        x, _ = load_audio(path, DEFAULT_SR)
         buffers[part] = x
-        sample_rates.append(sr)
-
-    # Длительность выбирается по самому короткому стему, чтобы не подмешивать тишину
-    # и не обрезать случайно второй по длине файл.
     frames = min(len(x) for x in buffers.values())
     if frames < DEFAULT_SR:
         raise ValueError("Стемы короче одной секунды: проверьте результат Demucs.")
     for part in PARTS:
         buffers[part] = fit_length(buffers[part], frames)
-
     original_metrics = {part: measure_audio(buffers[part], DEFAULT_SR) for part in PARTS}
-    kick_mono = buffers["drums"].mean(axis=1).copy()
+    kick_trigger = buffers["drums"].mean(axis=1).copy()
 
-    log("Применяю настройки шин…")
-    if settings.use_gentle_eq:
-        for part in PARTS:
-            buffers[part] = gentle_eq(part, buffers[part])
-
-    if settings.use_stereo_widening and settings.drum_width > 1.0:
+    log("Обрабатываю отдельные шины согласно 12 переключателям…")
+    if settings.use_bass_multiband:
+        buffers["bass"] = _apply_bass_chain(buffers["bass"], buffers["drums"], log)
+    if settings.use_bass_enhance:
+        buffers["bass"] = _bass_enhance(buffers["bass"], buffers["drums"], log)
+    if settings.use_drum_punch:
+        buffers["drums"] = _process_drums(buffers["drums"])
+    if settings.use_vocal_surgical:
+        buffers["vocals"] = _process_vocals(buffers["vocals"])
+    if settings.use_instrument_eq:
+        buffers["other"] = _process_instruments(buffers["other"])
+    if settings.use_vocal_ducking:
+        buffers["other"] = duck_from_trigger(buffers["vocals"].mean(axis=1), buffers["other"],
+            settings.vocal_duck_db, block_ms=5.0, threshold_percentile=55.0, attack_ms=5.0, release_ms=140.0)
+    if settings.use_kick_ducking:
+        buffers["bass"] = duck_from_trigger(kick_trigger, buffers["bass"],
+            settings.kick_duck_db, block_ms=2.0, threshold_percentile=90.0, attack_ms=3.0, release_ms=80.0)
+    if settings.use_drum_widening:
         buffers["drums"] = widen(buffers["drums"], settings.drum_width, 120.0)
 
-    if settings.use_vocal_ducking:
-        buffers["other"] = duck_from_trigger(
-            buffers["vocals"].mean(axis=1), buffers["other"],
-            settings.vocal_duck_db, block_ms=5.0, threshold_percentile=55.0,
-            attack_ms=5.0, release_ms=140.0
-        )
-
-    if settings.use_kick_ducking:
-        buffers["bass"] = duck_from_trigger(
-            kick_mono, buffers["bass"], settings.kick_duck_db,
-            block_ms=2.0, threshold_percentile=90.0,
-            attack_ms=3.0, release_ms=80.0
-        )
-
-    gains = {
-        "drums": settings.drums_gain_db,
-        "bass": settings.bass_gain_db,
-        "other": settings.other_gain_db,
-        "vocals": settings.vocals_gain_db,
-    }
-    for part, gain_db in gains.items():
+    for part, gain_db in {
+        "drums": settings.drums_gain_db, "bass": settings.bass_gain_db,
+        "other": settings.other_gain_db, "vocals": settings.vocals_gain_db,
+    }.items():
         buffers[part] = (buffers[part] * db_to_gain(gain_db)).astype(np.float32)
 
     log("Собираю микс…")
     mix = np.zeros((frames, 2), dtype=np.float32)
     for part in PARTS:
         mix += buffers[part]
-
     before_master = measure_audio(mix, DEFAULT_SR)
-    loudness_before = safe_lufs(mix, DEFAULT_SR)
-    if loudness_before is None:
-        raise ValueError("Не удалось измерить LUFS микса; проверьте длительность и аудиоданные.")
 
-    # Нормализация до цели, затем лимитер. Если лимитер сработает сильно,
-    # итоговый LUFS окажется ниже целевого — это отражается в отчёте.
-    mix *= db_to_gain(settings.target_lufs - loudness_before)
-    limiter = Pedalboard([Limiter(threshold_db=settings.peak_ceiling_dbfs)])
-    mix = limiter(mix.T, DEFAULT_SR).T.astype(np.float32)
+    if settings.use_low_mono:
+        mix = _low_mono(mix, 120.0)
+    if settings.use_high_side_widening:
+        mix = _widen_high_side(mix, 3.0, 10000.0)
+    if settings.use_parallel_compression:
+        compressed = _compress(mix, -18.0, 2.0, 30, 180)
+        mix = (mix * 0.95 + compressed * 0.05).astype(np.float32)
+    if settings.use_master_bus:
+        mix = _peak_eq(mix, 150.0, 1.0, 0.8)
 
-    # Защита от нечисловых данных и жёсткая страховка от sample peak выше потолка.
+    loudness_before_norm = safe_lufs(mix, DEFAULT_SR)
+    if loudness_before_norm is None:
+        raise ValueError("Не удалось измерить LUFS микса; проверьте аудиоданные.")
+    mix *= db_to_gain(settings.target_lufs - loudness_before_norm)
+    if settings.use_master_bus:
+        mix = Pedalboard([Limiter(threshold_db=settings.peak_ceiling_dbfs)])(mix.T, DEFAULT_SR).T.astype(np.float32)
     if not np.isfinite(mix).all():
         raise ValueError("После обработки появились NaN/Inf.")
     peak_db = sample_peak_dbfs(mix)
@@ -508,35 +628,27 @@ def process_track(input_path: Path, output_path: Path, settings: Settings,
 
     final_metrics = measure_audio(mix, DEFAULT_SR)
     report = {
-        "application": APP_NAME,
-        "model": MODEL_NAME,
-        "source_file": str(input_path),
-        "output_file": str(output_path),
-        "settings": asdict(settings),
-        "source_info": {
-            "duration_seconds": round(sf.info(str(input_path)).duration, 3),
-            "sample_rate_hz": sf.info(str(input_path)).samplerate,
-            "channels": sf.info(str(input_path)).channels,
-        },
+        "application": APP_NAME, "model": MODEL_NAME, "source_file": str(input_path),
+        "analysis_output_cache": str(output_path), "settings": asdict(settings),
+        "source_info": {"duration_seconds": round(sf.info(str(input_path)).duration, 3),
+                         "sample_rate_hz": sf.info(str(input_path)).samplerate,
+                         "channels": sf.info(str(input_path)).channels},
         "stems_before_processing": original_metrics,
-        "mix_before_loudness_normalization": before_master,
+        "mix_before_master_processing": before_master,
         "mix_after_processing": final_metrics,
         "notes": [
-            "LUFS измерен после обработки; целевое значение может не достигаться из-за лимитера.",
+            "Это автоматизированная обработка, а не гарантия профессионального мастеринга.",
             "sample_peak_dbfs — пиковый уровень сэмплов, не измерение true peak.",
-            "Стереокорреляция — диагностическая метрика, не универсальная оценка качества.",
-            "Автоматические настройки необходимо проверить прослушиванием и сравнением с исходником."
+            "Целевой LUFS может не достигаться точно после ограничения пиков.",
+            "Параметры EQ/компрессии не анализируют художественный замысел; прослушайте A/B.",
         ],
     }
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), mix, DEFAULT_SR, subtype="FLOAT", format="WAV")
     report_path = output_path.with_suffix(".report.json")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    log(f"Готово: {output_path.name}")
-    log(f"Итог: {final_metrics['integrated_lufs']} LUFS; sample peak {final_metrics['sample_peak_dbfs']} dBFS")
-    log(f"Стереокорреляция: {final_metrics['stereo_correlation']}; отчёт: {report_path.name}")
+    log(f"Анализ завершён: {final_metrics['integrated_lufs']} LUFS; sample peak {final_metrics['sample_peak_dbfs']} dBFS")
+    log(f"Стереокорреляция: {final_metrics['stereo_correlation']}; исходник не изменён.")
     return report
 
 
@@ -544,8 +656,8 @@ class MixerApp:
     def __init__(self, root: TkinterDnD.Tk):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("760x720")
-        self.root.minsize(680, 620)
+        self.root.geometry("850x820")
+        self.root.minsize(760, 700)
         self.input_file: Path | None = None
         self.output_file: Path | None = None
         self.processing = False
@@ -562,7 +674,7 @@ class MixerApp:
         ttk.Label(frame, text="Stem Audio Post", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             frame,
-            text="Автоматизированный стартовый микс из четырёх стемов. Результат нужно проверить на слух.",
+            text="Demucs + 12 отключаемых блоков обработки. Сначала анализ и предпросмотр метрик; экспорт — только по вашей команде.",
             wraplength=700
         ).pack(anchor="w", pady=(2, 10))
 
@@ -579,7 +691,7 @@ class MixerApp:
         ttk.Button(buttons, text="Выбрать файл", command=self.choose_file).pack(side="left")
         self.run_button = ttk.Button(buttons, text="Обработать", command=self.start_processing, state="disabled")
         self.run_button.pack(side="left", padx=8)
-        self.export_button = ttk.Button(buttons, text="Экспорт WAV / FLAC", command=self.export_file, state="disabled")
+        self.export_button = ttk.Button(buttons, text="Экспортировать…", command=self.export_file, state="disabled")
         self.export_button.pack(side="left")
 
         self.info_label = ttk.Label(frame, text="Файл не выбран")
@@ -605,16 +717,31 @@ class MixerApp:
             value_label.grid(row=row, column=2, sticky="e", padx=4)
         settings_box.columnconfigure(1, weight=1)
 
-        options = ttk.Frame(frame)
-        options.pack(fill="x", pady=3)
-        self.eq_var = tk.BooleanVar(value=self.settings.use_gentle_eq)
-        self.vocal_duck_var = tk.BooleanVar(value=self.settings.use_vocal_ducking)
-        self.kick_duck_var = tk.BooleanVar(value=self.settings.use_kick_ducking)
-        self.width_var = tk.BooleanVar(value=self.settings.use_stereo_widening)
-        ttk.Checkbutton(options, text="Мягкий EQ", variable=self.eq_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(options, text="Освободить место вокалу", variable=self.vocal_duck_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(options, text="Сайдчейн баса от бочки", variable=self.kick_duck_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(options, text="Немного расширить барабаны", variable=self.width_var).pack(side="left")
+        options_box = ttk.LabelFrame(frame, text="12 переключателей обработки", padding=8)
+        options_box.pack(fill="x", pady=5)
+        self.option_vars = {}
+        option_defs = [
+            ("use_bass_multiband", "1. Бас: SUB / BODY / TOP", True),
+            ("use_bass_enhance", "2. Бас: гармоники + атака", True),
+            ("use_drum_punch", "3. Ударные: punch / EQ / сатурация", True),
+            ("use_vocal_surgical", "4. Вокал: EQ + компрессия", True),
+            ("use_instrument_eq", "5. Инструменты: EQ", True),
+            ("use_vocal_ducking", "6. Вокал → инструменты", True),
+            ("use_kick_ducking", "7. Бочка → бас", True),
+            ("use_drum_widening", "8. Расширить ударные", False),
+            ("use_low_mono", "9. Низ до 120 Гц в моно", True),
+            ("use_high_side_widening", "10. Расширить верх Side", False),
+            ("use_parallel_compression", "11. Параллельная компрессия", True),
+            ("use_master_bus", "12. Master EQ + лимитер", True),
+        ]
+        for i, (key, label, default) in enumerate(option_defs):
+            var = tk.BooleanVar(value=default)
+            self.option_vars[key] = var
+            ttk.Checkbutton(options_box, text=label, variable=var).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=6, pady=3
+            )
+        options_box.columnconfigure(0, weight=1)
+        options_box.columnconfigure(1, weight=1)
 
         self.progress = ttk.Progressbar(frame, mode="indeterminate")
         self.progress.pack(fill="x", pady=(8, 4))
@@ -675,13 +802,8 @@ class MixerApp:
 
     def current_settings(self) -> Settings:
         values = {key: float(var.get()) for key, var in self.gain_vars.items()}
-        return Settings(
-            **values,
-            use_gentle_eq=self.eq_var.get(),
-            use_vocal_ducking=self.vocal_duck_var.get(),
-            use_kick_ducking=self.kick_duck_var.get(),
-            use_stereo_widening=self.width_var.get(),
-        )
+        values.update({key: var.get() for key, var in self.option_vars.items()})
+        return Settings(**values)
 
     def start_processing(self):
         if self.processing or not self.input_file:
@@ -690,7 +812,11 @@ class MixerApp:
         self.run_button.configure(state="disabled")
         self.export_button.configure(state="disabled")
         self.progress.start(10)
-        self.output_file = self.input_file.with_name(self.input_file.stem + "_mix.wav")
+        # Intermediate WAV stays in the app cache; no file is saved beside the source automatically.
+        cache_dir = Path.home() / ".stem_audio_post" / "preview"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_name = hashlib.sha256(str(self.input_file.resolve()).encode("utf-8")).hexdigest()[:12]
+        self.output_file = cache_dir / f"{self.input_file.stem}_{cache_name}_preview.wav"
         settings = self.current_settings()
         input_path, output_path = self.input_file, self.output_file
         threading.Thread(
@@ -713,7 +839,19 @@ class MixerApp:
                 self.run_button.configure(state="normal" if self.input_file else "disabled")
                 self.export_button.configure(state="normal" if success and output_path.exists() else "disabled")
                 if success:
-                    messagebox.showinfo(APP_NAME, f"Обработка завершена.\n\n{output_path}")
+                    try:
+                        report_data = json.loads(output_path.with_suffix(".report.json").read_text(encoding="utf-8"))
+                        metrics = report_data["mix_after_processing"]
+                        summary = (
+                            f"LUFS: {metrics.get('integrated_lufs')}\n"
+                            f"Sample peak: {metrics.get('sample_peak_dbfs')} dBFS\n"
+                            f"Стереокорреляция: {metrics.get('stereo_correlation')}\n\n"
+                            "Файл не экспортирован автоматически.\n"
+                            "Нажмите «Экспортировать…», чтобы выбрать MP3, WAV или FLAC."
+                        )
+                    except Exception:
+                        summary = "Анализ завершён. Файл не экспортирован автоматически.\nНажмите «Экспортировать…», чтобы выбрать MP3, WAV или FLAC."
+                    messagebox.showinfo(APP_NAME, summary)
             self.root.after(0, finish)
 
     def log_exception_details(self, exc: BaseException):
@@ -726,20 +864,45 @@ class MixerApp:
         if not self.output_file or not self.output_file.is_file():
             return
         save_path = filedialog.asksaveasfilename(
-            title="Экспортировать результат",
+            title="Экспортировать обработанный трек",
             defaultextension=".flac",
-            initialfile=self.output_file.stem + ".flac",
-            filetypes=[("FLAC PCM 24-bit", "*.flac"), ("WAV float 32-bit", "*.wav")]
+            initialfile=self.input_file.stem + "_processed.flac" if self.input_file else "processed.flac",
+            filetypes=[("FLAC PCM 24-bit", "*.flac"), ("WAV PCM 24-bit", "*.wav"),
+                       ("WAV float 32-bit", "*.wav"), ("MP3 320 kbps", "*.mp3")]
         )
         if not save_path:
             return
+        target = Path(save_path)
         try:
             data, sr = sf.read(str(self.output_file), dtype="float32", always_2d=True)
-            target = Path(save_path)
-            if target.suffix.lower() == ".flac":
+            ext = target.suffix.lower()
+            if ext == ".flac":
                 sf.write(str(target), data, sr, format="FLAC", subtype="PCM_24")
+            elif ext == ".wav":
+                # Save 24-bit PCM by default for delivery; float preview remains in app cache.
+                sf.write(str(target), data, sr, format="WAV", subtype="PCM_24")
+            elif ext == ".mp3":
+                ffmpeg = shutil.which("ffmpeg")
+                if not ffmpeg:
+                    messagebox.showerror(APP_NAME, "Для MP3 нужен ffmpeg. Установите ffmpeg и добавьте его в PATH, либо экспортируйте WAV/FLAC.")
+                    return
+                # Temporary 24-bit PCM WAV is piped to ffmpeg; no intermediate user file is created.
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+                    temp_path = Path(temp.name)
+                try:
+                    sf.write(str(temp_path), data, sr, format="WAV", subtype="PCM_24")
+                    result = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(temp_path),
+                                             "-codec:a", "libmp3lame", "-b:a", "320k", str(target)],
+                                            capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(result.stderr.strip() or "ffmpeg не смог создать MP3")
+                finally:
+                    try: temp_path.unlink(missing_ok=True)
+                    except Exception: pass
             else:
-                sf.write(str(target), data, sr, format="WAV", subtype="FLOAT")
+                messagebox.showerror(APP_NAME, "Выберите MP3, WAV или FLAC.")
+                return
             self.log(f"Экспортировано: {target}")
             messagebox.showinfo(APP_NAME, f"Файл сохранён:\n{target}")
         except Exception as exc:
