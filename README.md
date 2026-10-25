@@ -1,4 +1,5 @@
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e7652310-6395-48e5-99d7-09d6a645fee9" />
+<img width="1920" height="1080" alt="Bitmap image" src="https://github.com/user-attachments/assets/da9e270c-e7c8-4d2d-aeee-f51cc513f3d3" />
 
 ## ℹ️ About
 
