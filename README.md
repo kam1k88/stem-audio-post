@@ -1,5 +1,9 @@
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e7652310-6395-48e5-99d7-09d6a645fee9" />
 
+## ℹ️ About
+
+Automated track mixing and mastering using neural networks. Features a drag-and-drop interface, stem separation (Demucs), and professional audio processing (Pedalboard)
+
 ## 🚀 Quick Start
 Just download 2 files: **`stem-audio-prod.py`** and **`start_stem-audio-prod.bat`** into a single folder.
 Double-click the **`.bat`** file to launch the app — it will automatically download and install all required libraries on the first run.
